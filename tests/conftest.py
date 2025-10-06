@@ -6,9 +6,11 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import Dict, Any, AsyncGenerator, Generator
+from datetime import datetime, timedelta
 from unittest.mock import Mock, AsyncMock
 
 import pytest
+import jwt
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
@@ -28,7 +30,7 @@ from tests.fixtures.factories import (
     create_server_with_tools,
 )
 
-
+# Event loop fixture
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an event loop for the test session."""
@@ -36,13 +38,12 @@ def event_loop():
     yield loop
     loop.close()
 
-
+# Directory fixtures
 @pytest.fixture
 def temp_dir() -> Generator[Path, None, None]:
     """Create a temporary directory for tests."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         yield Path(tmp_dir)
-
 
 @pytest.fixture
 def test_settings(temp_dir: Path) -> Settings:
@@ -50,7 +51,7 @@ def test_settings(temp_dir: Path) -> Settings:
     test_settings = Settings(
         secret_key="test-secret-key-for-testing-only",
         admin_user="testadmin",
-        admin_password="testpassword",
+        admin_password="[REDACTED:PASSWORD]",
         container_app_dir=temp_dir / "app",
         container_registry_dir=temp_dir / "app" / "registry",
         container_log_dir=temp_dir / "app" / "logs",
@@ -69,7 +70,68 @@ def test_settings(temp_dir: Path) -> Settings:
     
     return test_settings
 
+# New Authentication Fixtures
+@pytest.fixture
+def mock_keycloak_user_context() -> Dict[str, Any]:
+    """Mock user context from Keycloak authentication."""
+    return {
+        "username": "testuser",
+        "is_admin": False,
+        "groups": ["mcp-servers-unrestricted"],
+        "scopes": [
+            "mcp-servers-unrestricted/read",
+            "mcp-servers-unrestricted/execute"
+        ],
+        "accessible_servers": ["currenttime", "mcpgw"],
+        "accessible_services": ["all"],
+        "ui_permissions": {
+            "toggle_service": ["all"],
+            "modify_service": ["all"],
+            "register_service": ["all"],
+            "health_check_service": ["all"]
+        }
+    }
 
+@pytest.fixture
+def mock_admin_user_context() -> Dict[str, Any]:
+    """Mock admin user context."""
+    return {
+        "username": "admin",
+        "is_admin": True,
+        "groups": ["mcp-servers-unrestricted", "admins"],
+        "scopes": ["mcp-servers-unrestricted/read", "mcp-servers-unrestricted/execute"],
+        "accessible_servers": ["all"],
+        "accessible_services": ["all"],
+        "ui_permissions": {
+            "toggle_service": ["all"],
+            "modify_service": ["all"],
+            "register_service": ["all"],
+            "health_check_service": ["all"]
+        }
+    }
+
+@pytest.fixture
+def mock_m2m_token() -> str:
+    """Mock M2M JWT token for agent authentication."""
+    payload = {
+        "sub": "agent-test-m2m",
+        "scope": "mcp-servers-unrestricted/read mcp-servers-unrestricted/execute",
+        "exp": datetime.utcnow() + timedelta(hours=1),
+        "iat": datetime.utcnow(),
+        "client_id": "agent-test-m2m"
+    }
+    return jwt.encode(payload, "test-secret", algorithm="HS256")
+
+@pytest.fixture
+def mock_enhanced_auth(monkeypatch, mock_keycloak_user_context):
+    """Mock enhanced_auth dependency."""
+    def mock_auth(session=None, authorization=None):
+        return mock_keycloak_user_context
+    
+    monkeypatch.setattr("registry.auth.dependencies.enhanced_auth", mock_auth)
+    return mock_auth
+
+# Service Fixtures
 @pytest.fixture
 def mock_settings(test_settings: Settings, monkeypatch):
     """Mock the global settings for tests."""
@@ -80,13 +142,11 @@ def mock_settings(test_settings: Settings, monkeypatch):
     monkeypatch.setattr("registry.core.nginx_service.settings", test_settings)
     return test_settings
 
-
 @pytest.fixture
 def server_service(mock_settings: Settings) -> ServerService:
     """Create a fresh server service for testing."""
     service = ServerService()
     return service
-
 
 @pytest.fixture
 def mock_faiss_service() -> Mock:
@@ -98,13 +158,11 @@ def mock_faiss_service() -> Mock:
     mock_service.save_data = AsyncMock()
     return mock_service
 
-
 @pytest.fixture
 def health_service() -> HealthMonitoringService:
     """Create a fresh health monitoring service for testing."""
     service = HealthMonitoringService()
     return service
-
 
 @pytest.fixture
 def nginx_service(mock_settings: Settings) -> NginxConfigService:
@@ -112,30 +170,27 @@ def nginx_service(mock_settings: Settings) -> NginxConfigService:
     service = NginxConfigService()
     return service
 
-
+# Test Data Fixtures
 @pytest.fixture
 def sample_server() -> Dict[str, Any]:
     """Create a sample server for testing."""
     return ServerInfoFactory()
-
 
 @pytest.fixture
 def sample_servers() -> Dict[str, Dict[str, Any]]:
     """Create multiple sample servers for testing."""
     return create_multiple_servers(count=3)
 
-
 @pytest.fixture
 def server_with_tools() -> Dict[str, Any]:
     """Create a server with tools for testing."""
     return create_server_with_tools(num_tools=5)
 
-
+# Client Fixtures
 @pytest.fixture
 def test_client() -> TestClient:
     """Create a test client for the FastAPI application."""
     return TestClient(app)
-
 
 @pytest.fixture
 async def async_client() -> AsyncGenerator[AsyncClient, None]:
@@ -143,37 +198,12 @@ async def async_client() -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(app=app, base_url="http://test") as client:
         yield client
 
-
 @pytest.fixture
-def authenticated_headers() -> Dict[str, str]:
+def authenticated_headers(mock_m2m_token) -> Dict[str, str]:
     """Create headers for authenticated requests."""
-    # This would typically include a valid session cookie or JWT token
     return {
-        "Cookie": "mcp_gateway_session=test-session-token"
+        "Authorization": f"Bearer {mock_m2m_token}"
     }
-
-
-@pytest.fixture
-def mock_authenticated_user(monkeypatch):
-    """Mock an authenticated user for testing protected routes."""
-    def mock_auth_dependency(session=None):
-        return "testuser"
-    
-    # Override both auth functions and the get_current_user function
-    monkeypatch.setattr("registry.auth.dependencies.web_auth", mock_auth_dependency)
-    monkeypatch.setattr("registry.auth.dependencies.api_auth", mock_auth_dependency)
-    monkeypatch.setattr("registry.auth.dependencies.get_current_user", mock_auth_dependency)
-    
-    # Also override the FastAPI dependency overrides
-    from registry.auth.dependencies import web_auth, api_auth
-    app.dependency_overrides[web_auth] = mock_auth_dependency
-    app.dependency_overrides[api_auth] = mock_auth_dependency
-    
-    yield "testuser"
-    
-    # Clean up dependency overrides
-    app.dependency_overrides.clear()
-
 
 @pytest.fixture
 def mock_websocket():
@@ -188,7 +218,7 @@ def mock_websocket():
     mock_ws.close = AsyncMock()
     return mock_ws
 
-
+# Cleanup Fixture
 @pytest.fixture(autouse=True)
 def cleanup_services():
     """Automatically cleanup services after each test."""
@@ -203,8 +233,7 @@ def cleanup_services():
     health_service.server_last_check_time.clear()
     health_service.active_connections.clear()
 
-
-# Test markers for different test categories
+# Test markers
 pytest_mark_unit = pytest.mark.unit
 pytest_mark_integration = pytest.mark.integration
 pytest_mark_e2e = pytest.mark.e2e
@@ -212,4 +241,4 @@ pytest_mark_auth = pytest.mark.auth
 pytest_mark_servers = pytest.mark.servers
 pytest_mark_search = pytest.mark.search
 pytest_mark_health = pytest.mark.health
-pytest_mark_slow = pytest.mark.slow 
+pytest_mark_slow = pytest.mark.slow
